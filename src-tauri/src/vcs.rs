@@ -112,17 +112,39 @@ pub fn get_current_branch(repo: &Path) -> String {
             }
         }
         VCSEngine::Git => {
-            let output = std::process::Command::new("git")
-                .args(["--no-pager", "rev-parse", "--abbrev-ref", "HEAD"])
+            let symbolic = std::process::Command::new("git")
+                .args(["--no-pager", "symbolic-ref", "--short", "HEAD"])
                 .current_dir(repo)
                 .output();
-            if let Ok(o) = output {
-                String::from_utf8_lossy(&o.stdout).trim().to_string()
+            if let Ok(o) = symbolic {
+                if o.status.success() {
+                    let name = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if !name.is_empty() {
+                        name
+                    } else {
+                        "HEAD".into()
+                    }
+                } else {
+                    let output = std::process::Command::new("git")
+                        .args(["--no-pager", "rev-parse", "--abbrev-ref", "HEAD"])
+                        .current_dir(repo)
+                        .output();
+                    if let Ok(o) = output {
+                        let name = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        if !name.is_empty() {
+                            name
+                        } else {
+                            "HEAD".into()
+                        }
+                    } else {
+                        "HEAD".into()
+                    }
+                }
             } else {
                 "HEAD".into()
             }
         }
-        VCSEngine::None => "".into(),
+        VCSEngine::None => "NO_VCS".into(),
     };
     let took_ms = started.elapsed().as_millis();
     if crate::debug_enabled() && took_ms >= 20 {
@@ -133,9 +155,7 @@ pub fn get_current_branch(repo: &Path) -> String {
         };
         println!(
             "[BACKEND][vcs] get_current_branch engine={} value='{}' took={}ms",
-            engine_label,
-            branch,
-            took_ms
+            engine_label, branch, took_ms
         );
     }
     branch
@@ -170,12 +190,16 @@ pub fn get_current_revision(repo: &Path) -> String {
                 .current_dir(repo)
                 .output();
             if let Ok(o) = output {
-                String::from_utf8_lossy(&o.stdout).trim().to_string()
+                if o.status.success() {
+                    String::from_utf8_lossy(&o.stdout).trim().to_string()
+                } else {
+                    "HEADLESS".to_string()
+                }
             } else {
-                String::new()
+                "HEADLESS".to_string()
             }
         }
-        VCSEngine::None => String::new(),
+        VCSEngine::None => "HEADLESS".to_string(),
     };
     let took_ms = started.elapsed().as_millis();
     if crate::debug_enabled() && took_ms >= 20 {
@@ -270,6 +294,15 @@ pub fn get_file_diff(repo: &Path, file: &str, since: Option<&str>) -> String {
 
 // --- Git Implementation ---
 
+fn git_head_exists(repo: &Path) -> bool {
+    std::process::Command::new("git")
+        .args(["--no-pager", "rev-parse", "--verify", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 fn get_git_changes(repo: &Path, limit: usize, before_id: Option<String>) -> Vec<Change> {
     let started = Instant::now();
     if crate::debug_enabled() {
@@ -312,11 +345,20 @@ fn get_git_changes(repo: &Path, limit: usize, before_id: Option<String>) -> Vec<
     };
 
     if all_commits.is_empty() {
+        let working_copy_has_changes = !get_git_changed_files(repo, "@").is_empty();
         if crate::debug_enabled() {
             println!(
-                "[BACKEND][vcs/git] get_git_changes empty history took={}ms",
+                "[BACKEND][vcs/git] get_git_changes empty history working_copy_has_changes={} took={}ms",
+                working_copy_has_changes,
                 started.elapsed().as_millis()
             );
+        }
+        if working_copy_has_changes {
+            return vec![Change {
+                id: "@".to_string(),
+                description: "(working copy)".to_string(),
+                timestamp: "now".to_string(),
+            }];
         }
         return vec![];
     }
@@ -411,21 +453,12 @@ fn get_git_changed_files(repo: &Path, since: &str) -> HashMap<String, String> {
     }
     let mut combined_map = HashMap::new();
 
-    // 1. Get tracked changes (staged and committed)
-    for part in since.split(" | ") {
-        let rev = if part == "@" || part == "HEAD" {
-            "HEAD".to_string()
-        } else if part.contains("..") {
-            part.to_string()
-        } else {
-            format!("{}~1..{}", part, part)
-        };
-
+    let mut collect_name_status = |args: &[&str]| {
         if crate::debug_enabled() {
-            println!("[BACKEND][vcs/git] running git diff --name-status {}", rev);
+            println!("[BACKEND][vcs/git] running git {}", args.join(" "));
         }
         if let Ok(o) = std::process::Command::new("git")
-            .args(["--no-pager", "diff", "--name-status", &rev])
+            .args(args)
             .current_dir(repo)
             .output()
         {
@@ -443,6 +476,31 @@ fn get_git_changed_files(repo: &Path, since: &str) -> HashMap<String, String> {
                     }
                 }
             }
+        }
+    };
+
+    let head_exists = git_head_exists(repo);
+    let needs_working_copy_view = since.contains("@") || since.contains("HEAD");
+
+    if !head_exists && needs_working_copy_view {
+        if crate::debug_enabled() {
+            println!(
+                "[BACKEND][vcs/git] unborn HEAD detected, collecting staged + unstaged deltas"
+            );
+        }
+        collect_name_status(&["--no-pager", "diff", "--name-status"]);
+        collect_name_status(&["--no-pager", "diff", "--name-status", "--cached"]);
+    } else {
+        // 1. Get tracked changes (staged and committed)
+        for part in since.split(" | ") {
+            let rev = if part == "@" || part == "HEAD" {
+                "HEAD".to_string()
+            } else if part.contains("..") {
+                part.to_string()
+            } else {
+                format!("{}~1..{}", part, part)
+            };
+            collect_name_status(&["--no-pager", "diff", "--name-status", &rev]);
         }
     }
 
@@ -581,12 +639,52 @@ mod tests {
 
         let changed = get_changed_files(repo, "@");
 
-        assert_eq!(changed.get("src/existing.txt"), Some(&"modified".to_string()));
+        assert_eq!(
+            changed.get("src/existing.txt"),
+            Some(&"modified".to_string())
+        );
         assert_eq!(changed.get("src/deleted.txt"), Some(&"deleted".to_string()));
         assert_eq!(changed.get("src/new.txt"), Some(&"added".to_string()));
         assert!(
             !changed.contains_key("dist/bundle.js"),
             "dist artifacts must be ignored by graph filter"
         );
+    }
+
+    #[test]
+    fn test_get_changed_files_git_unborn_head_includes_staged_and_untracked() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+
+        run_git(repo, &["init"]);
+        run_git(repo, &["config", "user.email", "test@example.com"]);
+        run_git(repo, &["config", "user.name", "Test User"]);
+
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/staged.js"), "console.log('staged');\n").unwrap();
+        fs::write(repo.join("src/untracked.js"), "console.log('untracked');\n").unwrap();
+        run_git(repo, &["add", "src/staged.js"]);
+
+        let changed = get_changed_files(repo, "@");
+        assert_eq!(changed.get("src/staged.js"), Some(&"added".to_string()));
+        assert_eq!(changed.get("src/untracked.js"), Some(&"added".to_string()));
+    }
+
+    #[test]
+    fn test_get_changes_git_unborn_head_exposes_working_copy_and_headless_revision() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+
+        run_git(repo, &["init"]);
+        run_git(repo, &["config", "user.email", "test@example.com"]);
+        run_git(repo, &["config", "user.name", "Test User"]);
+        fs::write(repo.join("main.js"), "console.log('hello');\n").unwrap();
+        run_git(repo, &["add", "main.js"]);
+
+        let changes = get_changes(repo, 20, None);
+        assert!(!changes.is_empty(), "working copy row should be present");
+        assert_eq!(changes[0].id, "@");
+        assert_eq!(changes[0].description, "(working copy)");
+        assert_eq!(get_current_revision(repo), "HEADLESS");
     }
 }

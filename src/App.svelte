@@ -32,7 +32,9 @@
       .replace(/^\/+/, '');
   }
 
-  function seedHeatmapFromGraph(g) {
+  function seedHeatmapFromGraph(g, targetProjectId = activeProjectId) {
+    const project = getProjectById(targetProjectId);
+    if (!project) return;
     if (!g || !Array.isArray(g.nodes)) return;
     let changed = false;
     for (const node of g.nodes) {
@@ -40,13 +42,15 @@
       if (status !== 'added' && status !== 'modified') continue;
       const file = normalizeTouchedPath(node?.file || node?.id);
       if (!file) continue;
-      if (!heatmapData.has(file)) {
-        heatmapData.set(file, { seq: ++heatCounter, touchedAt: Date.now() });
+      if (!project.heatmapData.has(file)) {
+        project.heatCounter = (project.heatCounter || 0) + 1;
+        project.heatmapData.set(file, { seq: project.heatCounter, touchedAt: Date.now() });
         changed = true;
       }
     }
-    if (changed) {
-      heatmapData = new Map(heatmapData);
+    if (changed && activeProjectId === targetProjectId) {
+      heatCounter = project.heatCounter || 0;
+      heatmapData = new Map(project.heatmapData);
     }
   }
 
@@ -147,6 +151,7 @@
     if (cmd === 'get_current_branch') return 'main';
     if (cmd === 'get_repo_path') return '/path/to/despair';
     if (cmd === 'select_repo') return '/new/path/to/despair';
+    if (cmd === 'set_repo_path') return args?.path || '/path/to/despair';
     if (cmd === 'get_file_source') return 'defmodule MockModule do\n  def hello, do: :world\nend';
     if (cmd === 'save_file') { debugLog('[MOCK] saving file', args); return null; }
     return null;
@@ -173,14 +178,123 @@
   let refreshing = $state(false); // Update state
   let currentFortune = $state('');
   let repoPath = $state('');
+  let repoActionMessage = $state('');
   let showDropdown = $state(false);
   let highlightedIndex = $state(-1);
   let loadGraphRequestSeq = 0;
   let inFlightLoadGraph = 0;
+  let loadingMore = $state(false);
 
   // Heatmap state
   let heatmapData = $state(new Map());
   let heatCounter = 0;
+
+  // Multi-project tabs (one active project; inactive projects sleep).
+  let projectTabs = $state([]);
+  let activeProjectId = $state(null);
+
+  function shortRepoLabel(path) {
+    if (!path) return '(unknown repo)';
+    const normalized = String(path).replaceAll('\\', '/').replace(/\/+$/, '');
+    const parts = normalized.split('/');
+    return parts[parts.length - 1] || normalized;
+  }
+
+  function extractErrorMessage(error) {
+    if (!error) return '';
+    if (typeof error === 'string') return error;
+    if (typeof error === 'object') {
+      if (typeof error.message === 'string') return error.message;
+      try {
+        return JSON.stringify(error);
+      } catch (_e) {
+        return String(error);
+      }
+    }
+    return String(error);
+  }
+
+  function setRepoActionMessage(message) {
+    repoActionMessage = message ? String(message) : '';
+  }
+
+  function createProjectSession(path) {
+    const normalizedPath = String(path || '');
+    return {
+      id: normalizedPath,
+      path: normalizedPath,
+      label: shortRepoLabel(normalizedPath),
+      graph: { nodes: [], edges: [] },
+      changes: [],
+      changesLimit: CHANGES_PAGE_SIZE,
+      hasMoreChanges: true,
+      bookmarks: [],
+      currentBranch: '',
+      currentRevision: '',
+      since: '@',
+      heatmapData: new Map(),
+      heatCounter: 0,
+      loadingMore: false,
+    };
+  }
+
+  function getProjectById(id) {
+    if (!id) return null;
+    return projectTabs.find((p) => p.id === id) || null;
+  }
+
+  function getProjectByPath(path) {
+    if (!path) return null;
+    const normalizedPath = String(path);
+    return projectTabs.find((p) => p.path === normalizedPath) || null;
+  }
+
+  function getActiveProject() {
+    return getProjectById(activeProjectId);
+  }
+
+  function upsertProject(path) {
+    const existing = getProjectByPath(path);
+    if (existing) return existing;
+    const created = createProjectSession(path);
+    projectTabs = [...projectTabs, created];
+    return created;
+  }
+
+  function applyProjectToGlobals(project) {
+    if (!project) return;
+    repoPath = project.path;
+    graph = project.graph;
+    changes = project.changes;
+    changesLimit = project.changesLimit;
+    hasMoreChanges = project.hasMoreChanges;
+    bookmarks = project.bookmarks;
+    currentBranch = project.currentBranch;
+    currentRevision = project.currentRevision;
+    since = project.since;
+    heatCounter = project.heatCounter || 0;
+    heatmapData = new Map(project.heatmapData || new Map());
+    loadingMore = Boolean(project.loadingMore);
+    refreshFortune();
+  }
+
+  function syncGlobalsToActiveProject() {
+    const project = getActiveProject();
+    if (!project) return;
+    project.path = repoPath;
+    project.label = shortRepoLabel(repoPath);
+    project.graph = graph;
+    project.changes = changes;
+    project.changesLimit = changesLimit;
+    project.hasMoreChanges = hasMoreChanges;
+    project.bookmarks = bookmarks;
+    project.currentBranch = currentBranch;
+    project.currentRevision = currentRevision;
+    project.since = since || '@';
+    project.heatCounter = heatCounter;
+    project.heatmapData = new Map(heatmapData);
+    project.loadingMore = loadingMore;
+  }
 
   function refreshFortune() {
     try {
@@ -235,33 +349,48 @@
     return [...matchedBookmarks, ...matchedChanges];
   });
 
-  async function loadTimelineChanges() {
+  async function loadTimelineChanges(targetProjectId = activeProjectId) {
+    const project = getProjectById(targetProjectId);
+    if (!project) return;
     const c = await invokeTraced('get_changes', { limit: ALL_CHANGES_LIMIT }, { warnAfterMs: 8000 });
     const unique = uniqueChanges(c);
     debugLog(`[FRONTEND][TRACE] timeline fetched raw=${c?.length || 0}, unique=${unique.length}`);
-    changes = unique;
-    changesLimit = unique.length;
-    hasMoreChanges = false; // We paginate locally after prefetching full history.
+    project.changes = unique;
+    project.changesLimit = unique.length;
+    project.hasMoreChanges = false; // We paginate locally after prefetching full history.
+
+    if (activeProjectId === targetProjectId) {
+      changes = unique;
+      changesLimit = unique.length;
+      hasMoreChanges = false;
+      refreshFortune();
+    }
   }
 
-  async function loadGraph(isInitial = false) {
+  async function loadGraph(isInitial = false, targetProjectId = activeProjectId) {
+    const project = getProjectById(targetProjectId);
+    if (!project) return;
     const requestId = ++loadGraphRequestSeq;
     const requestStartedAt = performance.now();
-    const previousBranch = currentBranch;
-    const sinceArg = since && since !== '' ? since : null;
+    const previousBranch = project.currentBranch || '';
+    const sinceArg = project.since && project.since !== '' ? project.since : null;
     inFlightLoadGraph += 1;
     debugLog(
       `[FRONTEND][BRANCH][req:${requestId}] loadGraph start initial=${isInitial} since=${sinceArg} branch='${previousBranch}' inFlight=${inFlightLoadGraph}`
     );
-    refreshFortune();
 
-    if (isInitial) loading = true;
-    else refreshing = true;
+    if (activeProjectId === targetProjectId) {
+      if (isInitial) loading = true;
+      else refreshing = true;
+      refreshFortune();
+    }
 
     // Safety timeout to clear loader if backend hangs
     const safetyTimeout = setTimeout(() => {
-      loading = false;
-      refreshing = false;
+      if (activeProjectId === targetProjectId) {
+        loading = false;
+        refreshing = false;
+      }
     }, 10000);
 
     try {
@@ -275,47 +404,64 @@
       debugLog(
         `[FRONTEND][BRANCH][req:${requestId}] loadGraph done in ${elapsedMs}ms nodes=${g.nodes.length} edges=${g.edges.length} bookmarks=${b.length} branch='${previousBranch}'->'${curr}'`
       );
-      graph = g;
-      seedHeatmapFromGraph(g);
-      bookmarks = b;
-      currentBranch = curr;
+      project.graph = g;
+      project.bookmarks = b;
+      project.currentBranch = curr;
+      seedHeatmapFromGraph(g, targetProjectId);
+      if (activeProjectId === targetProjectId) {
+        graph = g;
+        bookmarks = b;
+        currentBranch = curr;
+      }
     } catch (e) {
       console.error(`[FRONTEND][BRANCH][req:${requestId}] loadGraph failed`, e);
     } finally {
       clearTimeout(safetyTimeout);
-      loading = false;
-      refreshing = false;
+      if (activeProjectId === targetProjectId) {
+        loading = false;
+        refreshing = false;
+      }
       inFlightLoadGraph = Math.max(0, inFlightLoadGraph - 1);
       debugLog(`[FRONTEND][BRANCH][req:${requestId}] loadGraph finish inFlight=${inFlightLoadGraph}`);
     }
   }
 
-  let loadingMore = $state(false);
-  async function loadMoreChanges() {
-    if (loadingMore || changes.length === 0 || !hasMoreChanges) return 0;
-    refreshFortune();
-    loadingMore = true;
+  async function loadMoreChanges(targetProjectId = activeProjectId) {
+    const project = getProjectById(targetProjectId);
+    if (!project) return 0;
+    if (project.loadingMore || project.changes.length === 0 || !project.hasMoreChanges) return 0;
+    if (activeProjectId === targetProjectId) {
+      refreshFortune();
+      loadingMore = true;
+    }
+    project.loadingMore = true;
     let loadedCount = 0;
     try {
-      const targetLimit = Math.max(changes.length, changesLimit) + CHANGES_PAGE_SIZE;
+      const targetLimit = Math.max(project.changes.length, project.changesLimit) + CHANGES_PAGE_SIZE;
       const expanded = await invokeTraced('get_changes', { limit: targetLimit }, { warnAfterMs: 8000 });
       const expandedUnique = uniqueChanges(expanded);
-      const existingIds = new Set(changes.map(c => c.id));
+      const existingIds = new Set(project.changes.map(c => c.id));
       const tail = expandedUnique.filter(c => !existingIds.has(c.id));
 
       if (tail.length > 0) {
-        changes = [...changes, ...tail];
+        project.changes = [...project.changes, ...tail];
         loadedCount = tail.length;
       }
 
-      changesLimit = Math.max(changesLimit, expandedUnique.length);
+      project.changesLimit = Math.max(project.changesLimit, expandedUnique.length);
       if (expandedUnique.length < targetLimit || loadedCount === 0) {
-        hasMoreChanges = false;
+        project.hasMoreChanges = false;
+      }
+      if (activeProjectId === targetProjectId) {
+        changes = project.changes;
+        changesLimit = project.changesLimit;
+        hasMoreChanges = project.hasMoreChanges;
       }
     } catch (e) {
       console.error('[FRONTEND] Error loading more changes:', e);
     } finally {
-      loadingMore = false;
+      project.loadingMore = false;
+      if (activeProjectId === targetProjectId) loadingMore = false;
     }
     return loadedCount;
   }
@@ -341,19 +487,226 @@
     }
     
     if (!since || since === '') since = '@';
+    const active = getActiveProject();
+    if (active) {
+      active.since = since;
+    }
     debugLog(`[FRONTEND][BRANCH] setSince resolved='${since}' (from '${previousSince}') -> triggering loadGraph`);
-    loadGraph(false);
+    loadGraph(false, activeProjectId);
+  }
+
+  async function activateProjectTab(
+    projectId,
+    { skipBackendSet = false, isInitial = false, waitForRefresh = false } = {}
+  ) {
+    const next = getProjectById(projectId);
+    if (!next) return;
+
+    if (activeProjectId !== projectId) {
+      syncGlobalsToActiveProject();
+      activeProjectId = projectId;
+      applyProjectToGlobals(next);
+    }
+
+    showDropdown = false;
+    highlightedIndex = -1;
+
+    if (!skipBackendSet) {
+      try {
+        const switchedPath = await invokeTraced(
+          'set_repo_path',
+          { path: next.path },
+          { warnAfterMs: 10000 }
+        );
+        next.path = switchedPath;
+        next.label = shortRepoLabel(switchedPath);
+        repoPath = switchedPath;
+      } catch (e) {
+        console.error('[FRONTEND] Failed to activate project tab:', e);
+        return;
+      }
+    }
+
+    const refreshPromise = Promise.all([
+      loadTimelineChanges(projectId),
+      loadGraph(isInitial, projectId),
+    ]);
+
+    if (waitForRefresh) {
+      await refreshPromise;
+    } else {
+      refreshPromise.catch((e) => console.error('[FRONTEND] Project refresh failed:', e));
+    }
+  }
+
+  function closeProjectTab(projectId, event) {
+    event?.stopPropagation?.();
+    if (projectTabs.length <= 1) return;
+    const idx = projectTabs.findIndex((p) => p.id === projectId);
+    if (idx < 0) return;
+
+    const wasActive = activeProjectId === projectId;
+    const remaining = projectTabs.filter((p) => p.id !== projectId);
+    projectTabs = remaining;
+
+    if (!wasActive) return;
+    const next = remaining[Math.max(0, idx - 1)] || remaining[0];
+    if (!next) return;
+    activateProjectTab(next.id).catch((e) =>
+      console.error('[FRONTEND] Failed to activate fallback project tab:', e)
+    );
+  }
+
+  function isEditableTarget(target) {
+    if (!(target instanceof HTMLElement)) return false;
+    return (
+      target.tagName === 'INPUT' ||
+      target.tagName === 'TEXTAREA' ||
+      target.tagName === 'SELECT' ||
+      target.isContentEditable
+    );
+  }
+
+  function activateRelativeProjectTab(step) {
+    const total = projectTabs.length;
+    if (total <= 1) return;
+    const currentIndex = projectTabs.findIndex((project) => project.id === activeProjectId);
+    if (currentIndex < 0) return;
+    const nextIndex = (currentIndex + step + total) % total;
+    const nextProject = projectTabs[nextIndex];
+    if (!nextProject || nextProject.id === activeProjectId) return;
+    activateProjectTab(nextProject.id).catch((e) =>
+      console.error('[FRONTEND] Failed to activate project tab from hotkey:', e)
+    );
+  }
+
+  function activateProjectTabByNumber(numberKey) {
+    const total = projectTabs.length;
+    if (total === 0) return;
+    const index = numberKey === 9 ? total - 1 : Math.min(numberKey - 1, total - 1);
+    const targetProject = projectTabs[index];
+    if (!targetProject || targetProject.id === activeProjectId) return;
+    activateProjectTab(targetProject.id).catch((e) =>
+      console.error('[FRONTEND] Failed to activate numbered project tab:', e)
+    );
+  }
+
+  function handleAppHotkeys(event) {
+    if (!(event.metaKey || event.ctrlKey)) return;
+    if (event.altKey) return;
+    if (isEditableTarget(event.target)) return;
+    const key = String(event.key || '').toLowerCase();
+
+    if (key === 'n') {
+      event.preventDefault();
+      selectRepo();
+      return;
+    }
+
+    if (key === 'o') {
+      event.preventDefault();
+      changeCurrentRepo();
+      return;
+    }
+
+    if (event.key === ']' || event.code === 'BracketRight') {
+      event.preventDefault();
+      activateRelativeProjectTab(1);
+      return;
+    }
+
+    if (event.key === '[' || event.code === 'BracketLeft') {
+      event.preventDefault();
+      activateRelativeProjectTab(-1);
+      return;
+    }
+
+    const digit = Number(event.key);
+    if (Number.isInteger(digit) && digit >= 1 && digit <= 9) {
+      event.preventDefault();
+      activateProjectTabByNumber(digit);
+    }
   }
 
   async function selectRepo() {
     try {
       const newPath = await invokeTraced('select_repo', {}, { warnAfterMs: 10000 });
       debugLog(`[FRONTEND][TRACE] repo selected: ${newPath}`);
-      repoPath = newPath;
-      since = '@';
-      await Promise.all([loadTimelineChanges(), loadGraph(true)]);
+      setRepoActionMessage('');
+      const project = upsertProject(newPath);
+      project.path = newPath;
+      project.label = shortRepoLabel(newPath);
+      await activateProjectTab(project.id, {
+        skipBackendSet: true,
+        isInitial: true,
+        waitForRefresh: true,
+      });
     } catch (e) {
-      debugLog('Dialog cancelled or failed', e);
+      const message = extractErrorMessage(e);
+      const lowered = message.toLowerCase();
+      if (lowered.includes('no folder selected') || lowered.includes('dialog cancelled')) {
+        debugLog('Dialog cancelled', e);
+        return;
+      }
+      setRepoActionMessage(message || 'Failed to open selected directory.');
+      console.error('[FRONTEND] selectRepo failed:', e);
+    }
+  }
+
+  async function changeCurrentRepo() {
+    const current = getActiveProject();
+    if (!current) return;
+    try {
+      const newPath = await invokeTraced('select_repo', {}, { warnAfterMs: 10000 });
+      debugLog(`[FRONTEND][TRACE] change current repo -> ${newPath}`);
+      setRepoActionMessage('');
+
+      const duplicate = getProjectByPath(newPath);
+      if (duplicate && duplicate.id !== current.id) {
+        const remaining = projectTabs.filter((p) => p.id !== current.id);
+        projectTabs = remaining;
+        await activateProjectTab(duplicate.id, {
+          skipBackendSet: true,
+          isInitial: true,
+          waitForRefresh: true,
+        });
+        return;
+      }
+
+      if (newPath === current.path) {
+        await activateProjectTab(current.id, {
+          skipBackendSet: true,
+          isInitial: true,
+          waitForRefresh: true,
+        });
+        return;
+      }
+
+      const replacement = createProjectSession(newPath);
+      const index = projectTabs.findIndex((p) => p.id === current.id);
+      if (index >= 0) {
+        const nextTabs = [...projectTabs];
+        nextTabs[index] = replacement;
+        projectTabs = nextTabs;
+      } else {
+        projectTabs = [replacement];
+      }
+      activeProjectId = replacement.id;
+      applyProjectToGlobals(replacement);
+      await activateProjectTab(replacement.id, {
+        skipBackendSet: true,
+        isInitial: true,
+        waitForRefresh: true,
+      });
+    } catch (e) {
+      const message = extractErrorMessage(e);
+      const lowered = message.toLowerCase();
+      if (lowered.includes('no folder selected') || lowered.includes('dialog cancelled')) {
+        debugLog('Dialog cancelled', e);
+        return;
+      }
+      setRepoActionMessage(message || 'Failed to change directory.');
+      console.error('[FRONTEND] changeCurrentRepo failed:', e);
     }
   }
 
@@ -388,15 +741,23 @@
     debugLog(`[FRONTEND][TRACE] ${traceNow()} theme applied`);
     refreshFortune();
     debugLog(`[FRONTEND][TRACE] ${traceNow()} fortune refreshed`);
-    repoPath = await invokeTraced('get_repo_path', {}, { warnAfterMs: 8000 });
-    debugLog(`[FRONTEND][TRACE] ${traceNow()} repo path resolved: ${repoPath}`);
-    await Promise.all([loadTimelineChanges(), loadGraph(true)]);
+    const initialRepoPath = await invokeTraced('get_repo_path', {}, { warnAfterMs: 8000 });
+    const initialProject = upsertProject(initialRepoPath);
+    activeProjectId = initialProject.id;
+    applyProjectToGlobals(initialProject);
+    debugLog(`[FRONTEND][TRACE] ${traceNow()} repo path resolved: ${initialRepoPath}`);
+    await Promise.all([
+      loadTimelineChanges(initialProject.id),
+      loadGraph(true, initialProject.id),
+    ]);
     debugLog(`[FRONTEND][TRACE] ${traceNow()} initial data loaded in ${Math.round(performance.now() - mountStart)}ms`);
 
     listen('graph-updated', (event) => {
       const startedAt = performance.now();
-      const previousBranch = currentBranch;
-      const previousRevision = currentRevision;
+      const activeProject = getActiveProject();
+      if (!activeProject) return;
+      const previousBranch = activeProject.currentBranch || '';
+      const previousRevision = activeProject.currentRevision || '';
       const payload = event?.payload || {};
       const payloadBranch = payload.current_branch || '';
       const payloadRevision = payload.current_revision || '';
@@ -406,26 +767,27 @@
       const payloadEdges = payload.graph?.edges?.length || 0;
       const payloadBookmarks = Array.isArray(payload.bookmarks) ? payload.bookmarks.length : 0;
       debugLog(
-        `[FRONTEND][BRANCH][event] graph-updated recv branch='${previousBranch}'->'${payloadBranch || previousBranch}' rev='${previousRevision || '-'}'->'${payloadRevision || previousRevision || '-'}' since='${since}'->'${payloadSince || since}' reset=${payloadSinceReset} nodes=${payloadNodes} edges=${payloadEdges} bookmarks=${payloadBookmarks}`
+        `[FRONTEND][BRANCH][event] graph-updated recv branch='${previousBranch}'->'${payloadBranch || previousBranch}' rev='${previousRevision || '-'}'->'${payloadRevision || previousRevision || '-'}' since='${activeProject.since}'->'${payloadSince || activeProject.since}' reset=${payloadSinceReset} nodes=${payloadNodes} edges=${payloadEdges} bookmarks=${payloadBookmarks}`
       );
-      graph = event.payload.graph;
-      seedHeatmapFromGraph(event.payload.graph);
+      activeProject.graph = event.payload.graph;
+      seedHeatmapFromGraph(event.payload.graph, activeProject.id);
       if (event.payload.current_branch) {
-        currentBranch = event.payload.current_branch;
+        activeProject.currentBranch = event.payload.current_branch;
       }
       if (event.payload.current_revision) {
-        currentRevision = event.payload.current_revision;
+        activeProject.currentRevision = event.payload.current_revision;
       }
       if (Array.isArray(event.payload.bookmarks)) {
-        bookmarks = event.payload.bookmarks;
+        activeProject.bookmarks = event.payload.bookmarks;
       }
       const branchChanged = Boolean(payloadBranch) && payloadBranch !== previousBranch;
       const revisionChanged = Boolean(payloadRevision) && payloadRevision !== previousRevision;
-      if ((payloadSinceReset || branchChanged) && payloadSince && since !== payloadSince) {
-        since = payloadSince;
+      if ((payloadSinceReset || branchChanged) && payloadSince && activeProject.since !== payloadSince) {
+        activeProject.since = payloadSince;
       }
+      applyProjectToGlobals(activeProject);
       if (branchChanged || revisionChanged) {
-        loadTimelineChanges()
+        loadTimelineChanges(activeProject.id)
           .then(() => {
             debugLog(
               `[FRONTEND][BRANCH][event] timeline refreshed in ${Math.round(performance.now() - startedAt)}ms (branchChanged=${branchChanged} revisionChanged=${revisionChanged})`
@@ -440,25 +802,35 @@
     });
 
     listen('file-touched', (event) => {
+      const activeProject = getActiveProject();
+      if (!activeProject) return;
       const path = normalizeTouchedPath(event.payload);
       if (!path) return;
       debugLog(`[FRONTEND] File touched: ${path}`);
-      
-      heatmapData.set(path, { seq: ++heatCounter, touchedAt: Date.now() });
-      if (heatmapData.size > 100) {
+
+      activeProject.heatCounter = (activeProject.heatCounter || 0) + 1;
+      activeProject.heatmapData.set(path, {
+        seq: activeProject.heatCounter,
+        touchedAt: Date.now(),
+      });
+      if (activeProject.heatmapData.size > 100) {
         let oldestKey = null;
         let oldestSeq = Infinity;
-        for (const [key, value] of heatmapData.entries()) {
+        for (const [key, value] of activeProject.heatmapData.entries()) {
           const seq = typeof value === 'number' ? value : Number(value?.seq ?? 0);
           if (seq < oldestSeq) {
             oldestSeq = seq;
             oldestKey = key;
           }
         }
-        if (oldestKey) heatmapData.delete(oldestKey);
+        if (oldestKey) activeProject.heatmapData.delete(oldestKey);
       }
-      // Force reactivity in Svelte 5 for Map
-      heatmapData = new Map(heatmapData);
+
+      if (activeProjectId === activeProject.id) {
+        heatCounter = activeProject.heatCounter;
+        // Force reactivity in Svelte 5 for Map
+        heatmapData = new Map(activeProject.heatmapData);
+      }
     }).catch((e) => {
       console.error('[FRONTEND] Failed to register file-touched listener:', e);
     });
@@ -467,16 +839,73 @@
 
 </script>
 
+<svelte:window onkeydown={handleAppHotkeys} />
+
 <div class="eyeloss-page">
+  <div class="eyeloss-project-tabs">
+    {#each projectTabs as project}
+      <button
+        type="button"
+        class="eyeloss-project-tab"
+        class:eyeloss-project-tab--active={project.id === activeProjectId}
+        title={project.path}
+        onclick={() => activateProjectTab(project.id)}
+      >
+        <span class="eyeloss-project-tab__name">{project.label}</span>
+        {#if project.currentBranch}
+          <span class="eyeloss-project-tab__branch">{project.currentBranch}</span>
+        {/if}
+        {#if projectTabs.length > 1}
+          <span
+            class="eyeloss-project-tab__close"
+            role="button"
+            tabindex="0"
+            onclick={(e) => closeProjectTab(project.id, e)}
+            onkeydown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') closeProjectTab(project.id, e);
+            }}
+          >
+            x
+          </span>
+        {/if}
+      </button>
+    {/each}
+    <button
+      type="button"
+      class="eyeloss-project-tab eyeloss-project-tab--new"
+      onclick={selectRepo}
+      title="Open another repo in a new tab"
+      aria-label="Open new project tab"
+    >
+      +
+    </button>
+  </div>
+
   <div class="eyeloss-controls">
     <div class="eyeloss-controls__left">
       <div class="eyeloss-controls__row">
         <span class="eyeloss-controls__repo">{repoPath}</span>
-        <button type="button" class="btn btn-ghost" onclick={selectRepo} style="font-size: 0.6rem; padding: 2px 6px;">Change</button>
+        <button
+          type="button"
+          class="btn btn-ghost"
+          onclick={changeCurrentRepo}
+          style="font-size: 0.6rem; padding: 2px 6px;"
+          title="Change repo in current tab"
+        >
+          Change
+        </button>
       </div>
       <div class="eyeloss-controls__row">
         <span class="eyeloss-controls__branch">branch: {currentBranch}</span>
       </div>
+      {#if currentBranch === 'NO_VCS'}
+        <div class="eyeloss-controls__row eyeloss-controls__warning">
+          no vcs detected: file-view mode only, init git/jj for history
+        </div>
+      {/if}
+      {#if repoActionMessage}
+        <div class="eyeloss-controls__row eyeloss-controls__error">{repoActionMessage}</div>
+      {/if}
     </div>
 
     <div class="eyeloss-controls__center">

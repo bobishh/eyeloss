@@ -363,6 +363,7 @@
 
   let panelCollapsed = $state(false);
   let searchQuery = $state('');
+  let defaultNodeWindowViewMode = $state('diff');
 
   let dragging = $state(false);
   let dragStart = $state({ x: 0, y: 0 });
@@ -696,6 +697,7 @@
     const nextWindow = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       nodeId: node.id,
+      initialViewMode: defaultNodeWindowViewMode,
       x: Math.max(16, 24 + slot * 28),
       y: Math.max(16, 20 + slot * 22),
       width: detailWidth,
@@ -715,6 +717,10 @@
     selectedNodeIds = next;
     activeNodeId = node.id;
     ensureNodeWindow(node);
+  }
+
+  function toggleDefaultNodeWindowViewMode() {
+    defaultNodeWindowViewMode = defaultNodeWindowViewMode === 'diff' ? 'source' : 'diff';
   }
 
   function closeNodeWindow(nodeId) {
@@ -1056,13 +1062,17 @@
       nodeMap[n.id] = n;
     }
 
-    const repulsionStrength = 35000;
+    const repulsionStrength = 30000;
     const springStrength = 0.003;
     const springLength = 320;
     const centerGravity = 0.0008;
     const clusterGravity = 0.015;
     const damping = 0.82;
     const maxVelocity = 20;
+    const maxRepulsionForce = 18;
+    const maxClusterRepulsionForce = 8;
+    const worldRadius = Math.max(900, 420 + Math.sqrt(nodes.length) * 200);
+    const hardWorldRadius = worldRadius * 1.8;
 
     const clusterSums = {};
     for (const node of nodes) {
@@ -1079,7 +1089,7 @@
     }
 
     const cKeys = Object.keys(clusterCenters);
-    const interClusterRepulsion = 90000;
+    const interClusterRepulsion = 55000;
     const clusterForces = {};
     for (const key of cKeys) clusterForces[key] = { x: 0, y: 0 };
 
@@ -1092,7 +1102,7 @@
         let dist = Math.sqrt(dx * dx + dy * dy);
         if (dist < 10) dist = 10;
 
-        const force = interClusterRepulsion / (dist * dist);
+        const force = Math.min(maxClusterRepulsionForce, interClusterRepulsion / (dist * dist));
         const fx = (dx / dist) * force;
         const fy = (dy / dist) * force;
 
@@ -1126,7 +1136,7 @@
 
         const sameCluster = (a.cluster_key || getClusterKey(a.id)) === (b.cluster_key || getClusterKey(b.id));
         const rep = sameCluster ? repulsionStrength : repulsionStrength * 1.5;
-        let force = rep / (dist * dist);
+        let force = Math.min(maxRepulsionForce, rep / (dist * dist));
 
         const fx = (dx / dist) * force;
         const fy = (dy / dist) * force;
@@ -1207,6 +1217,15 @@
       node.vx -= node.x * centerGravity * invMass;
       node.vy -= node.y * centerGravity * invMass;
 
+      // Soft boundary: nudge far-away nodes back toward center to prevent long-run drift.
+      const radialDist = Math.sqrt(node.x * node.x + node.y * node.y);
+      if (radialDist > worldRadius && radialDist > 0) {
+        const overflow = radialDist - worldRadius;
+        const pull = overflow * 0.0022;
+        node.vx -= (node.x / radialDist) * pull;
+        node.vy -= (node.y / radialDist) * pull;
+      }
+
       node.vx *= damping;
       node.vy *= damping;
 
@@ -1219,6 +1238,16 @@
 
       node.x += node.vx;
       node.y += node.vy;
+
+      // Hard boundary as a final safety net.
+      const postDist = Math.sqrt(node.x * node.x + node.y * node.y);
+      if (postDist > hardWorldRadius && postDist > 0) {
+        const scale = hardWorldRadius / postDist;
+        node.x *= scale;
+        node.y *= scale;
+        node.vx *= 0.2;
+        node.vy *= 0.2;
+      }
     }
 
     simulationIterations++;
@@ -1757,11 +1786,8 @@
     const _anim = animating;
     const _drag = draggedNode;
     const _windows = nodeWindows;
-    const _heat = heatmapData;
 
     if (!canvas || _w === 0 || _h === 0) return;
-
-    if (_heat.size > 0) animating = true;
 
     function loop() {
       if (animating) {
@@ -1819,6 +1845,15 @@
         {panelCollapsed ? '>' : '<'} Nodes ({simNodes.length})
       </button>
       {#if !panelCollapsed}
+        <button
+          class="eyeloss-nav-panel__toggle"
+          type="button"
+          onclick={toggleDefaultNodeWindowViewMode}
+          title="Default mode for newly opened node windows"
+          style="border-left: 1px solid var(--bg-300); width: 88px; text-align: center;"
+        >
+          {defaultNodeWindowViewMode === 'source' ? 'Open: Source' : 'Open: Diff'}
+        </button>
         <button
           class="eyeloss-nav-panel__toggle"
           type="button"
@@ -1941,6 +1976,7 @@
         {saveFile}
         {diffCache}
         {sourceCache}
+        initialViewMode={nodeWindow.initialViewMode || 'diff'}
         sourceReferences={getSourceReferenceLinksForNode(nodeWindow.nodeId)}
         onOpenReference={openSourceWindowForReference}
         onclose={() => closeNodeWindow(nodeWindow.nodeId)}

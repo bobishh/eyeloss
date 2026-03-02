@@ -7,11 +7,13 @@ use graph::{Graph, Node};
 use notify::{event::EventKind, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::Mutex;
 use parser::{Parser, PluggableParser};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
+use walkdir::WalkDir;
 
 struct AppState {
     repo: Mutex<PathBuf>,
@@ -155,6 +157,40 @@ fn resolve_graph_edges(g: &mut Graph) {
     resolve_graph_edges_for_sources(g, &empty);
 }
 
+fn is_ignored_runtime_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    for segment in normalized.split('/') {
+        match segment {
+            ".git" | ".jj" | "node_modules" | "target" | "_build" | "deps" | "dist"
+            | ".svelte-kit" | ".output" => return true,
+            _ => {}
+        }
+    }
+    normalized.starts_with("src-tauri/gen/")
+}
+
+fn collect_non_vcs_files(repo: &Path) -> Vec<String> {
+    const MAX_FILES: usize = 5_000;
+    let mut files = Vec::new();
+    for entry in WalkDir::new(repo).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(rel_path_buf) = entry.path().strip_prefix(repo) else {
+            continue;
+        };
+        let rel_path = rel_path_buf.display().to_string().replace('\\', "/");
+        if rel_path.is_empty() || is_ignored_runtime_path(&rel_path) {
+            continue;
+        }
+        files.push(rel_path);
+        if files.len() >= MAX_FILES {
+            break;
+        }
+    }
+    files
+}
+
 fn perform_graph_build(
     parsers: &[Box<dyn Parser>],
     repo: PathBuf,
@@ -172,7 +208,11 @@ fn perform_graph_build(
     }
 
     let mut g = Graph::new();
-    let files_to_process = if let Some(ref revset) = since {
+    let vcs_engine = vcs::detect_engine(&repo);
+    let no_vcs_mode = matches!(vcs_engine, vcs::VCSEngine::None);
+    let files_to_process = if no_vcs_mode {
+        collect_non_vcs_files(&repo)
+    } else if let Some(ref revset) = since {
         let changed = vcs::get_changed_files(&repo, revset);
         changed.keys().cloned().collect::<Vec<String>>()
     } else {
@@ -208,13 +248,33 @@ fn perform_graph_build(
             }
         } else {
             unsupported_files += 1;
+            if no_vcs_mode {
+                let line_count = std::fs::read_to_string(&full_path)
+                    .map(|s| s.lines().count())
+                    .unwrap_or(0);
+                g.add_nodes(vec![Node {
+                    id: rel_path.clone(),
+                    label: rel_path.clone(),
+                    kind: "file".into(),
+                    file: rel_path.clone(),
+                    line_count,
+                    change_status: "added".into(),
+                    functions: vec![],
+                }]);
+            }
         }
     }
 
     resolve_graph_edges(&mut g);
     g.finalize();
 
-    if let Some(revset) = since {
+    if no_vcs_mode {
+        for node in &mut g.nodes {
+            if node.change_status == "unchanged" {
+                node.change_status = "added".to_string();
+            }
+        }
+    } else if let Some(revset) = since {
         let changed = vcs::get_changed_files(&repo, &revset);
         g.filter_to_changes(&changed, include_neighbors);
     }
@@ -257,6 +317,34 @@ fn resolve_initial_repo() -> PathBuf {
     cwd
 }
 
+fn activate_repo(app: &AppHandle, state: &AppState, path_buf: PathBuf) -> Result<String, String> {
+    let canonical_path = path_buf.canonicalize().unwrap_or(path_buf);
+    if !canonical_path.is_dir() {
+        return Err("Selected path is not a directory".to_string());
+    }
+
+    {
+        let mut repo = state.repo.lock();
+        *repo = canonical_path.clone();
+    }
+
+    let fp = fingerprint(&canonical_path);
+    *state.last_fingerprint.lock() = fp;
+    *state.last_since.lock() = None;
+    *state.last_include_neighbors.lock() = false;
+    *state.last_branch.lock() = vcs::get_current_branch(&canonical_path);
+    *state.last_revision.lock() = vcs::get_current_revision(&canonical_path);
+    *state.watcher_flush_scheduled.lock() = false;
+    *state.watcher_pending_vcs_meta.lock() = false;
+    *state.watcher_last_vcs_meta_at.lock() = None;
+    state.watcher_pending_paths.lock().clear();
+
+    let watcher = setup_watcher(app);
+    *state.watcher.lock() = watcher;
+
+    Ok(canonical_path.display().to_string())
+}
+
 // --- Tauri commands ---
 
 #[tauri::command]
@@ -276,40 +364,22 @@ async fn select_repo(app: AppHandle, state: tauri::State<'_, AppState>) -> Resul
     let folder = rx.recv().map_err(|_| "Dialog cancelled".to_string())?;
 
     if let Some(path) = folder {
-        let path_buf = match path {
+        let selected_path = match path {
             tauri_plugin_dialog::FilePath::Path(p) => p,
             tauri_plugin_dialog::FilePath::Url(u) => u
                 .to_file_path()
                 .map_err(|_| "Invalid URL path".to_string())?,
         };
-
-        if matches!(vcs::detect_engine(&path_buf), vcs::VCSEngine::None) {
-            return Err("This directory contains no record of its own failures. Sloposcope requires a Git or JJ repository to function. How disappointing.".to_string());
-        }
-
-        {
-            let mut repo = state.repo.lock();
-            *repo = path_buf.clone();
-        }
-
-        let fp = fingerprint(&path_buf);
-        *state.last_fingerprint.lock() = fp;
-        *state.last_since.lock() = None;
-        *state.last_include_neighbors.lock() = false;
-        *state.last_branch.lock() = vcs::get_current_branch(&path_buf);
-        *state.last_revision.lock() = vcs::get_current_revision(&path_buf);
-
-        let watcher = setup_watcher(&app);
-        *state.watcher.lock() = watcher;
+        let activated = activate_repo(&app, &state, selected_path)?;
 
         if debug_enabled() {
             println!(
                 "[BACKEND][cmd] select_repo done path={} took={}ms",
-                path_buf.display(),
+                activated,
                 started.elapsed().as_millis()
             );
         }
-        Ok(path_buf.display().to_string())
+        Ok(activated)
     } else {
         if debug_enabled() {
             println!(
@@ -319,6 +389,29 @@ async fn select_repo(app: AppHandle, state: tauri::State<'_, AppState>) -> Resul
         }
         Err("No folder selected".into())
     }
+}
+
+#[tauri::command]
+async fn set_repo_path(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<String, String> {
+    let started = Instant::now();
+    if debug_enabled() {
+        println!("[BACKEND][cmd] set_repo_path start path={}", path);
+    }
+
+    let activated = activate_repo(&app, &state, PathBuf::from(path))?;
+
+    if debug_enabled() {
+        println!(
+            "[BACKEND][cmd] set_repo_path done path={} took={}ms",
+            activated,
+            started.elapsed().as_millis()
+        );
+    }
+    Ok(activated)
 }
 
 #[tauri::command]
@@ -661,7 +754,11 @@ fn refresh_vcs_state(handle: &AppHandle) {
     }
 }
 
-fn queue_watcher_batch(handle: &AppHandle, vcs_meta_changed: bool, interesting_paths: Vec<PathBuf>) {
+fn queue_watcher_batch(
+    handle: &AppHandle,
+    vcs_meta_changed: bool,
+    interesting_paths: Vec<PathBuf>,
+) {
     if !vcs_meta_changed && interesting_paths.is_empty() {
         return;
     }
@@ -764,14 +861,20 @@ fn flush_watcher_batch(handle: &AppHandle) {
             .lock()
             .clone()
             .unwrap_or_else(|| "@".to_string());
-        let changed_statuses = vcs::get_changed_files(&repo, &since_filter);
+        let no_vcs_mode = matches!(vcs::detect_engine(&repo), vcs::VCSEngine::None);
+        let changed_statuses = if no_vcs_mode {
+            HashMap::new()
+        } else {
+            vcs::get_changed_files(&repo, &since_filter)
+        };
 
         if debug_enabled() {
             println!(
-                "[BACKEND][watcher] flush batch paths={} changed_set={} since={}",
+                "[BACKEND][watcher] flush batch paths={} changed_set={} since={} no_vcs={}",
                 pending_paths.len(),
                 changed_statuses.len(),
-                since_filter
+                since_filter,
+                no_vcs_mode
             );
         }
 
@@ -788,6 +891,18 @@ fn flush_watcher_batch(handle: &AppHandle) {
                 continue;
             };
             let rel_path = rel_path_buf.display().to_string().replace('\\', "/");
+            if no_vcs_mode {
+                if path.exists() && path.is_file() {
+                    let already_known = graph.nodes.iter().any(|n| n.file == rel_path);
+                    let status = if already_known { "modified" } else { "added" }.to_string();
+                    actionable.push((path.clone(), rel_path.clone(), status));
+                    purge_paths.insert(rel_path);
+                } else {
+                    // Deleted/non-file path: drop stale node.
+                    purge_paths.insert(rel_path);
+                }
+                continue;
+            }
             if let Some(change_status) = changed_statuses.get(&rel_path).cloned() {
                 actionable.push((path.clone(), rel_path.clone(), change_status));
                 purge_paths.insert(rel_path);
@@ -1039,11 +1154,7 @@ mod tests {
     fn vcs_refresh_deferred_when_meta_pending_or_recent() {
         let quiet = Duration::from_millis(500);
         assert!(should_defer_vcs_refresh(true, None, quiet));
-        assert!(should_defer_vcs_refresh(
-            false,
-            Some(Instant::now()),
-            quiet
-        ));
+        assert!(should_defer_vcs_refresh(false, Some(Instant::now()), quiet));
 
         let stale = Instant::now()
             .checked_sub(Duration::from_millis(700))
@@ -1259,6 +1370,7 @@ pub fn run() {
             save_file,
             get_repo_path,
             select_repo,
+            set_repo_path,
         ])
         .setup(|app| {
             if debug_enabled() {

@@ -18,6 +18,7 @@
     saveFile,
     diffCache,
     sourceCache,
+    initialViewMode = 'diff',
     sourceReferences = [],
     onOpenReference = null,
     onclose = null,
@@ -29,6 +30,7 @@
   let fileDiff = $state(null);
   let fileSource = $state(null);
   let viewMode = $state('diff'); // 'diff' | 'source'
+  let initialModeAppliedForNodeId = $state(null);
   let diffLoading = $state(false);
   let sourceLoading = $state(false);
   let diffRequestFile = $state(null);
@@ -36,6 +38,7 @@
   let isSaving = $state(false);
   let showSignatures = $state(false);
   let expandedChunks = $state(new Set());
+  let autoFallbackAppliedForFile = $state(null);
 
   let diffLines = $derived.by(() => {
     if (!fileDiff) return [];
@@ -211,6 +214,17 @@
   }
 
   $effect(() => {
+    const nodeId = node?.id;
+    if (!nodeId) {
+      initialModeAppliedForNodeId = null;
+      return;
+    }
+    if (initialModeAppliedForNodeId === nodeId) return;
+    viewMode = initialViewMode === 'source' ? 'source' : 'diff';
+    initialModeAppliedForNodeId = nodeId;
+  });
+
+  $effect(() => {
     const file = node?.file;
     if (!file) {
       fileDiff = null;
@@ -219,6 +233,7 @@
       sourceLoading = false;
       diffRequestFile = null;
       sourceRequestFile = null;
+      autoFallbackAppliedForFile = null;
       return;
     }
 
@@ -255,6 +270,22 @@
         });
     } else if (sourceRequestFile !== file) {
       sourceLoading = false;
+    }
+  });
+
+  $effect(() => {
+    const file = node?.file;
+    if (!file) return;
+    if (autoFallbackAppliedForFile === file) return;
+    if (viewMode !== 'diff') return;
+    if (node?.change_status !== 'added') return;
+    if (diffLoading) return;
+    if (fileSource === null) return;
+
+    const normalizedDiff = typeof fileDiff === 'string' ? fileDiff.trim() : '';
+    if (normalizedDiff.length === 0) {
+      viewMode = 'source';
+      autoFallbackAppliedForFile = file;
     }
   });
 </script>
@@ -345,6 +376,23 @@
                 {/if}
               </div>
             {/each}
+          </div>
+        {:else}
+          <div class="eyeloss-node-details__meta" style="margin-top: 16px;">
+            No diff available for this file yet.
+            {#if node.change_status === 'added'}
+              It is a new file, so showing full source is usually more useful.
+            {/if}
+          </div>
+          <div class="eyeloss-node-details__meta" style="margin-top: 8px;">
+            <button
+              class="btn btn-primary"
+              type="button"
+              style="font-size: 0.65rem; padding: 4px 8px;"
+              onclick={() => (viewMode = 'source')}
+            >
+              Open Source
+            </button>
           </div>
         {/if}
       {:else}

@@ -52,6 +52,13 @@ html, body, #app {
   font-family: var(--font-mono);
 }
 
+button,
+input,
+select,
+textarea {
+  border-radius: 0 !important;
+}
+
 .eyeloss-page {
   width: 100%;
   height: 100%;
@@ -64,11 +71,116 @@ html, body, #app {
   background-size: 20px 20px;
 }
 
+/* Disable text selection visuals across the shell UI. */
+.eyeloss-page,
+.eyeloss-page * {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.eyeloss-page *::selection {
+  background: transparent;
+  color: inherit;
+}
+
+/* Allow normal text selection/copy only inside window content. */
+.window-content,
+.window-content * {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.window-content::selection,
+.window-content *::selection {
+  background: color-mix(in srgb, var(--primary) 52%, transparent);
+  color: var(--text);
+}
+
 .eyeloss-container {
   flex: 1;
   position: relative;
   overflow: hidden;
   cursor: grab;
+}
+
+.eyeloss-project-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  padding: 0 12px;
+  background: var(--bg-100);
+  border-bottom: 1px solid var(--bg-300);
+  overflow-x: auto;
+}
+
+.eyeloss-project-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 320px;
+  padding: 6px 10px;
+  background: var(--bg-200);
+  color: var(--text-dim);
+  border: 1px solid var(--bg-300);
+  border-bottom: 0;
+  margin: 0 4px 0 0;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  text-transform: none;
+  cursor: pointer;
+}
+
+.eyeloss-project-tab--new {
+  flex: 0 0 auto;
+  width: 28px;
+  max-width: 28px;
+  justify-content: center;
+  padding: 6px 0;
+  margin-right: 0;
+  font-size: 0.9rem;
+  color: var(--text);
+}
+
+.eyeloss-project-tab--new:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+.eyeloss-project-tab--active {
+  background: var(--bg);
+  color: var(--text);
+  border-color: var(--primary);
+}
+
+.eyeloss-project-tab__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 150px;
+}
+
+.eyeloss-project-tab__branch {
+  color: var(--secondary);
+  font-size: 0.62rem;
+  white-space: nowrap;
+}
+
+.eyeloss-project-tab__close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border: 1px solid var(--bg-300);
+  background: var(--bg-100);
+  color: var(--text-dim);
+  font-size: 0.62rem;
+  line-height: 1;
+}
+
+.eyeloss-project-tab__close:hover {
+  color: var(--text);
+  border-color: var(--secondary);
 }
 
 .eyeloss-container canvas {
@@ -117,6 +229,24 @@ html, body, #app {
   color: var(--secondary);
   font-weight: 600;
   letter-spacing: 0.02em;
+}
+
+.eyeloss-controls__error {
+  color: var(--red);
+  font-size: 0.68rem;
+  max-width: 520px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.eyeloss-controls__warning {
+  color: var(--secondary);
+  font-size: 0.68rem;
+  max-width: 520px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .eyeloss-controls__center {

@@ -179,10 +179,7 @@ pub fn bookmarks(repo: &Path) -> Vec<Bookmark> {
 pub fn changed_files(repo: &Path, revset: &str) -> HashMap<String, String> {
     let started = Instant::now();
     if crate::debug_enabled() {
-        println!(
-            "[BACKEND][vcs/jj] changed_files start revset='{}'",
-            revset
-        );
+        println!("[BACKEND][vcs/jj] changed_files start revset='{}'", revset);
     }
     let mut results = HashMap::new();
 
